@@ -1,0 +1,134 @@
+name: Release
+
+# Builds ctrl-tower for Windows, Linux and macOS, then publishes a GitHub
+# release with the binaries and installers attached.
+#
+# Push a tag matching mygo.json's version (git tag v0.1.0 && git push origin v0.1.0),
+# or run it by hand from the Actions tab, which tags the commit v<version> itself.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # creating the release (and its tag on manual runs)
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Read and check the version
+        id: version
+        run: |
+          version="$(jq -r .version mygo.json)"
+          tag="v$version"
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "$tag" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match mygo.json version $version (expected $tag)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Test
+        run: CGO_ENABLED=0 go test ./...
+
+  build:
+    needs: prepare
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - { name: Windows, os: ubuntu-latest, platform: "windows/amd64,windows/arm64" }
+          - { name: Linux, os: ubuntu-latest, platform: "linux/amd64,linux/arm64" }
+          - { name: macOS, os: macos-latest, platform: "darwin/universal" }
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      # mygo skips the Windows installer with only a warning when makensis is missing.
+      - name: Install NSIS
+        if: matrix.name == 'Windows'
+        run: sudo apt-get update && sudo apt-get install -y nsis
+      - name: Build
+        run: go tool mygo build -platform "${{ matrix.platform }}"
+      # Collect the files to release, failing on any that mygo did not make,
+      # so a skipped packaging step cannot publish an incomplete release.
+      - name: Collect release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          take() { test -f "$1" || { echo "::error::missing $1"; exit 1; }; cp "$1" "dist/$2"; }
+          case "${{ matrix.name }}" in
+            Windows)
+              for arch in amd64 arm64; do
+                take "build/windows-$arch/ctrl-tower.exe" "ctrl-tower-$VERSION-windows-$arch.exe"
+                take "build/windows-$arch/ctrl-tower-setup-$VERSION-$arch.exe" "ctrl-tower-setup-$VERSION-$arch.exe"
+              done ;;
+            Linux)
+              for arch in amd64 arm64; do
+                take "build/linux-$arch/ctrl-tower" "ctrl-tower-$VERSION-linux-$arch"
+                take "build/linux-$arch/ctrl-tower-$VERSION-linux-$arch.tar.gz" "ctrl-tower-$VERSION-linux-$arch.tar.gz"
+                take "build/linux-$arch/ctrl-tower_${VERSION}_$arch.deb" "ctrl-tower_${VERSION}_$arch.deb"
+              done ;;
+            macOS)
+              take "build/darwin-universal/ctrl-tower-$VERSION.dmg" "ctrl-tower-$VERSION-macos-universal.dmg" ;;
+          esac
+          ls -l dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Publish the release
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            # Re-run, or a release made by hand: replace its files and make sure it is public.
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          else
+            # On manual runs this also creates the tag at the built commit.
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "ctrl-tower $TAG" --generate-notes
+          fi
+      - name: Check the release is published
+        run: |
+          set -euo pipefail
+          read -r draft assets < <(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,assets --jq '"\(.isDraft) \(.assets | length)"')
+          echo "draft=$draft assets=$assets"
+          test "$draft" = "false"
+          test "$assets" -ge "$(ls dist | wc -l)"
+          echo "Published https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
